@@ -65,7 +65,7 @@ def apply_exclusions(items, excludes):
     return [item for item in items if not any(ex in item["name"].lower() for ex in excludes)]
 
 
-def search_components(query, limit=15, category_filter=None):
+def search_components(query, category_filter=None):
     search_query, excludes = parse_exclusions(query)
     if not search_query:
         return []
@@ -76,17 +76,17 @@ def search_components(query, limit=15, category_filter=None):
 
     exact_matches = [item for item in pool if search_query.lower() in item["name"].lower()]
     if exact_matches:
-        return apply_exclusions(exact_matches, excludes)[:limit]
+        return apply_exclusions(exact_matches, excludes)
 
     pool_names = [item["name"] for item in pool]
-    results = process.extract(search_query, pool_names, scorer=fuzz.token_set_ratio, limit=limit * 3)
+    results = process.extract(search_query, pool_names, scorer=fuzz.token_set_ratio, limit=len(pool_names))
     matched = []
     for result in results:
         name, score = result[0], result[1]
         if score >= 45:
             item = next(i for i in pool if i["name"] == name)
             matched.append(item)
-    return apply_exclusions(matched, excludes)[:limit]
+    return apply_exclusions(matched, excludes)
 
 
 def detect_intent(user_message, recent_context=""):
@@ -136,6 +136,56 @@ def detect_intent(user_message, recent_context=""):
         return {"clear": True, "search_term": user_message, "category": None, "follow_up": ""}
 
 
+def format_grouped_results(matches):
+    """Format results grouped by category. Uses ChatGPT to label groups of items
+    that don't fit neatly into existing categories."""
+    if len(matches) == 1:
+        m = matches[0]
+        return f"**{m['name']}** ({m['category']}) — {format_price(m['price'])}"
+
+    # Group by category
+    from collections import OrderedDict
+    groups = OrderedDict()
+    for m in matches:
+        cat = m["category"]
+        if cat not in groups:
+            groups[cat] = []
+        groups[cat].append(m)
+
+    # If only one category, simple list
+    if len(groups) == 1:
+        cat = list(groups.keys())[0]
+        lines = [f"- **{m['name']}** — {format_price(m['price'])}" for m in matches]
+        return f"**{cat}** ({len(matches)} items):\n\n" + "\n".join(lines)
+
+    # Multiple categories — use ChatGPT to generate a group label for mixed results
+    cat_summary = ", ".join(f"{cat} ({len(items)})" for cat, items in groups.items())
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Given categories of PC components found in a search, provide a short 2-4 word group label. Respond with ONLY the label text, nothing else."
+                },
+                {"role": "user", "content": f"Categories found: {cat_summary}"}
+            ],
+            temperature=0.3,
+            max_tokens=20
+        )
+        group_label = response.choices[0].message.content.strip()
+    except Exception:
+        group_label = "Search Results"
+
+    lines = [f"**{group_label}** — {len(matches)} items found:\n"]
+    for cat, items in groups.items():
+        lines.append(f"\n**{cat}:**")
+        for m in items:
+            lines.append(f"- {m['name']} — {format_price(m['price'])}")
+
+    return "\n".join(lines)
+
+
 def build_response(user_message):
     msg = user_message.strip().lower()
 
@@ -182,8 +232,7 @@ def build_response(user_message):
     if category_filter:
         cat_items = [item for item in PRICES if category_has_tag(item["category"], category_filter)]
         if cat_items and search_term.lower().replace(" ", "") in category_filter.lower().replace(" ", ""):
-            lines = [f"- **{m['name']}** — {format_price(m['price'])}" for m in cat_items[:15]]
-            return f"**{category_filter}** ({len(cat_items)} items):\n\n" + "\n".join(lines)
+            return format_grouped_results(cat_items)
 
     matches = search_components(search_term, category_filter=category_filter)
     if not matches:
@@ -192,12 +241,7 @@ def build_response(user_message):
     if not matches:
         return f'Sorry, I couldn\'t find anything matching **"{user_message}"**. Try a different name or type `help` for examples.'
 
-    if len(matches) == 1:
-        m = matches[0]
-        return f"**{m['name']}** ({m['category']}) — {format_price(m['price'])}"
-
-    lines = [f"- **{m['name']}** ({m['category']}) — {format_price(m['price'])}" for m in matches]
-    return f"Found {len(matches)} matches:\n\n" + "\n".join(lines)
+    return format_grouped_results(matches)
 
 
 # --- Streamlit UI ---
