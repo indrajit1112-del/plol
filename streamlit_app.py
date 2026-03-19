@@ -16,14 +16,15 @@ def load_prices():
     ws = wb.active
     items = []
     for row in ws.iter_rows(min_row=2, values_only=True):
-        name, price = row[0], row[1]
+        category, name, price = row[0], row[1], row[2]
         if name and price is not None:
-            items.append({"name": str(name).strip(), "price": int(price)})
+            items.append({"category": str(category).strip() if category else "Other", "name": str(name).strip(), "price": int(price)})
     wb.close()
     return items
 
 PRICES = load_prices()
 COMPONENT_NAMES = [item["name"] for item in PRICES]
+CATEGORIES = sorted(set(item["category"] for item in PRICES))
 
 
 def format_price(price):
@@ -58,29 +59,35 @@ def apply_exclusions(items, excludes):
     return [item for item in items if not any(ex in item["name"].lower() for ex in excludes)]
 
 
-def search_components(query, limit=15):
+def search_components(query, limit=15, category_filter=None):
     search_query, excludes = parse_exclusions(query)
     if not search_query:
         return []
 
-    exact_matches = [item for item in PRICES if search_query.lower() in item["name"].lower()]
+    pool = PRICES
+    if category_filter:
+        pool = [item for item in PRICES if item["category"].lower() == category_filter.lower()]
+
+    exact_matches = [item for item in pool if search_query.lower() in item["name"].lower()]
     if exact_matches:
         return apply_exclusions(exact_matches, excludes)[:limit]
 
-    results = process.extract(search_query, COMPONENT_NAMES, scorer=fuzz.token_set_ratio, limit=limit * 3)
+    pool_names = [item["name"] for item in pool]
+    results = process.extract(search_query, pool_names, scorer=fuzz.token_set_ratio, limit=limit * 3)
     matched = []
     for result in results:
         name, score = result[0], result[1]
         if score >= 45:
-            item = next(i for i in PRICES if i["name"] == name)
+            item = next(i for i in pool if i["name"] == name)
             matched.append(item)
     return apply_exclusions(matched, excludes)[:limit]
 
 
 def detect_intent(user_message):
     """Use ChatGPT to detect what component the user is looking for.
-    Returns a dict with 'clear' (bool), 'search_term' (str), and 'follow_up' (str)."""
+    Returns a dict with 'clear' (bool), 'search_term' (str), 'category' (str or null), and 'follow_up' (str)."""
     component_list = ", ".join(COMPONENT_NAMES[:50])
+    category_list = ", ".join(CATEGORIES)
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -88,15 +95,18 @@ def detect_intent(user_message):
                 "role": "system",
                 "content": (
                     "You are a component price assistant. The user wants to look up PC component prices. "
-                    "Available components include: " + component_list + "... and more.\n\n"
+                    "Available components include: " + component_list + "... and more.\n"
+                    "Available categories: " + category_list + "\n\n"
                     "Your job is to figure out what specific component or category the user wants. "
                     "Respond ONLY with a JSON object (no markdown, no code fences):\n"
-                    '{"clear": true/false, "search_term": "extracted search keyword", "follow_up": "question to ask if unclear"}\n\n'
+                    '{"clear": true/false, "search_term": "extracted search keyword", "category": "matching category or null", "follow_up": "question to ask if unclear"}\n\n'
                     "Rules:\n"
                     "- If the user mentions a specific model/part (e.g. '5080', 'DDR5', 'RTX 4070'), set clear=true and extract a search_term.\n"
                     "- If the user is vague (e.g. 'I need something fast', 'good GPU'), set clear=false and write a follow_up question.\n"
-                    "- If the user asks about a category (e.g. 'show me GPUs', 'RAM options'), set clear=true with the category as search_term.\n"
-                    "- Keep search_term short — just the key words for searching."
+                    "- If the user asks about a category (e.g. 'show me GPUs', 'RAM options', 'SSDs'), set clear=true with the category as search_term and set category to the matching category name.\n"
+                    "- If the query matches a category, set category to the EXACT category name from the list above.\n"
+                    "- Keep search_term short — just the key words for searching.\n"
+                    "- Set category to null if no specific category is detected."
                 )
             },
             {"role": "user", "content": user_message}
@@ -108,7 +118,7 @@ def detect_intent(user_message):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return {"clear": True, "search_term": user_message, "follow_up": ""}
+        return {"clear": True, "search_term": user_message, "category": None, "follow_up": ""}
 
 
 def build_response(user_message):
@@ -130,8 +140,14 @@ def build_response(user_message):
         )
 
     if msg in ("list all", "show all", "all", "list", "all prices", "show everything"):
-        lines = [f"- **{item['name']}** — {format_price(item['price'])}" for item in PRICES]
-        return "Here are all components:\n\n" + "\n".join(lines)
+        lines = []
+        for cat in CATEGORIES:
+            cat_items = [item for item in PRICES if item["category"] == cat]
+            if cat_items:
+                lines.append(f"\n**{cat}:**")
+                for item in cat_items:
+                    lines.append(f"- {item['name']} — {format_price(item['price'])}")
+        return "Here are all components:\n" + "\n".join(lines)
 
     # Use ChatGPT to detect intent
     intent = detect_intent(user_message)
@@ -140,18 +156,19 @@ def build_response(user_message):
         return intent.get("follow_up", "Could you be more specific about which component you're looking for?")
 
     search_term = intent.get("search_term", user_message)
-    matches = search_components(search_term)
+    category_filter = intent.get("category", None)
+    matches = search_components(search_term, category_filter=category_filter)
     if not matches:
-        # Fallback: try original message directly
+        # Fallback: try original message directly without category filter
         matches = search_components(user_message)
     if not matches:
         return f'Sorry, I couldn\'t find anything matching **"{user_message}"**. Try a different name or type `help` for examples.'
 
     if len(matches) == 1:
         m = matches[0]
-        return f"**{m['name']}** — {format_price(m['price'])}"
+        return f"**{m['name']}** ({m['category']}) — {format_price(m['price'])}"
 
-    lines = [f"- **{m['name']}** — {format_price(m['price'])}" for m in matches]
+    lines = [f"- **{m['name']}** ({m['category']}) — {format_price(m['price'])}" for m in matches]
     return f"Found {len(matches)} matches:\n\n" + "\n".join(lines)
 
 

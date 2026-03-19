@@ -12,9 +12,9 @@ def load_prices():
     ws = wb.active
     items = []
     for row in ws.iter_rows(min_row=2, values_only=True):
-        name, price = row[0], row[1]
+        category, name, price = row[0], row[1], row[2]
         if name and price is not None:
-            items.append({"name": str(name).strip(), "price": int(price)})
+            items.append({"category": str(category).strip() if category else "Other", "name": str(name).strip(), "price": int(price)})
     wb.close()
     return items
 
