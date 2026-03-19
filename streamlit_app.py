@@ -83,11 +83,16 @@ def search_components(query, limit=15, category_filter=None):
     return apply_exclusions(matched, excludes)[:limit]
 
 
-def detect_intent(user_message):
+def detect_intent(user_message, recent_context=""):
     """Use ChatGPT to detect what component the user is looking for.
     Returns a dict with 'clear' (bool), 'search_term' (str), 'category' (str or null), and 'follow_up' (str)."""
     component_list = ", ".join(COMPONENT_NAMES[:50])
     category_list = ", ".join(CATEGORIES)
+
+    context_note = ""
+    if recent_context:
+        context_note = f"\n\nRecent conversation for context:\n{recent_context}\nUse this context to understand follow-up replies from the user."
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -105,8 +110,10 @@ def detect_intent(user_message):
                     "- If the user is vague (e.g. 'I need something fast', 'good GPU'), set clear=false and write a follow_up question.\n"
                     "- If the user asks about a category (e.g. 'show me GPUs', 'RAM options', 'SSDs'), set clear=true with the category as search_term and set category to the matching category name.\n"
                     "- If the query matches a category, set category to the EXACT category name from the list above.\n"
+                    "- If the user is replying to a follow-up question, combine the context from the conversation to form a complete search_term.\n"
                     "- Keep search_term short — just the key words for searching.\n"
                     "- Set category to null if no specific category is detected."
+                    + context_note
                 )
             },
             {"role": "user", "content": user_message}
@@ -149,14 +156,27 @@ def build_response(user_message):
                     lines.append(f"- {item['name']} — {format_price(item['price'])}")
         return "Here are all components:\n" + "\n".join(lines)
 
-    # Use ChatGPT to detect intent
-    intent = detect_intent(user_message)
+    # Use ChatGPT to detect intent, include recent conversation for context
+    recent_context = ""
+    if len(st.session_state.messages) >= 3:
+        last_msgs = st.session_state.messages[-3:]
+        recent_context = " | ".join(f"{m['role']}: {m['content'][:100]}" for m in last_msgs)
+
+    intent = detect_intent(user_message, recent_context)
 
     if not intent.get("clear", True):
         return intent.get("follow_up", "Could you be more specific about which component you're looking for?")
 
     search_term = intent.get("search_term", user_message)
     category_filter = intent.get("category", None)
+
+    # If the query is essentially a category name, list all items in that category
+    if category_filter:
+        cat_items = [item for item in PRICES if item["category"].lower() == category_filter.lower()]
+        if cat_items and search_term.lower().replace(" ", "") in category_filter.lower().replace(" ", ""):
+            lines = [f"- **{m['name']}** — {format_price(m['price'])}" for m in cat_items[:15]]
+            return f"**{category_filter}** ({len(cat_items)} items):\n\n" + "\n".join(lines)
+
     matches = search_components(search_term, category_filter=category_filter)
     if not matches:
         # Fallback: try original message directly without category filter
