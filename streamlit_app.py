@@ -27,6 +27,12 @@ COMPONENT_NAMES = [item["name"] for item in PRICES]
 CATEGORIES = sorted(set(item["category"] for item in PRICES))
 
 
+def category_has_tag(category, tag):
+    """Check if a category contains the given tag (categories use 'or' as delimiter)."""
+    tags = [t.strip().lower() for t in category.split(" or ")]
+    return tag.strip().lower() in tags
+
+
 def format_price(price):
     s = str(price)
     if len(s) <= 3:
@@ -66,7 +72,7 @@ def search_components(query, limit=15, category_filter=None):
 
     pool = PRICES
     if category_filter:
-        pool = [item for item in PRICES if item["category"].lower() == category_filter.lower()]
+        pool = [item for item in PRICES if category_has_tag(item["category"], category_filter)]
 
     exact_matches = [item for item in pool if search_query.lower() in item["name"].lower()]
     if exact_matches:
@@ -104,12 +110,14 @@ def detect_intent(user_message, recent_context=""):
                     "Available categories: " + category_list + "\n\n"
                     "Your job is to figure out what specific component or category the user wants. "
                     "Respond ONLY with a JSON object (no markdown, no code fences):\n"
-                    '{"clear": true/false, "search_term": "extracted search keyword", "category": "matching category or null", "follow_up": "question to ask if unclear"}\n\n'
+                    '{"clear": true/false, "search_term": "extracted search keyword", "category": "matching tag or null", "follow_up": "question to ask if unclear"}\n\n'
                     "Rules:\n"
+                    "- Categories use 'or' as delimiter for tags. E.g. 'GPU or Nvidia' has tags 'GPU' and 'Nvidia'.\n"
+                    "- If the user says 'gpu', set category to 'GPU' (matches 'GPU or Nvidia', 'GPU or AMD', etc.).\n"
+                    "- If the user says 'nvidia', set category to 'Nvidia' (matches only 'GPU or Nvidia').\n"
                     "- If the user mentions a specific model/part (e.g. '5080', 'DDR5', 'RTX 4070'), set clear=true and extract a search_term.\n"
                     "- If the user is vague (e.g. 'I need something fast', 'good GPU'), set clear=false and write a follow_up question.\n"
-                    "- If the user asks about a category (e.g. 'show me GPUs', 'RAM options', 'SSDs'), set clear=true with the category as search_term and set category to the matching category name.\n"
-                    "- If the query matches a category, set category to the EXACT category name from the list above.\n"
+                    "- If the user asks about a category (e.g. 'show me GPUs', 'RAM options', 'SSDs'), set clear=true with the category as search_term and set category to the matching tag.\n"
                     "- If the user is replying to a follow-up question, combine the context from the conversation to form a complete search_term.\n"
                     "- Keep search_term short — just the key words for searching.\n"
                     "- Set category to null if no specific category is detected."
@@ -172,7 +180,7 @@ def build_response(user_message):
 
     # If the query is essentially a category name, list all items in that category
     if category_filter:
-        cat_items = [item for item in PRICES if item["category"].lower() == category_filter.lower()]
+        cat_items = [item for item in PRICES if category_has_tag(item["category"], category_filter)]
         if cat_items and search_term.lower().replace(" ", "") in category_filter.lower().replace(" ", ""):
             lines = [f"- **{m['name']}** — {format_price(m['price'])}" for m in cat_items[:15]]
             return f"**{category_filter}** ({len(cat_items)} items):\n\n" + "\n".join(lines)
