@@ -1,4 +1,5 @@
 import os
+import numpy as np
 from flask import Flask, request, jsonify, render_template_string
 from openai import OpenAI
 import core_engine
@@ -9,8 +10,12 @@ app = Flask(__name__)
 # Default to empty string for safety if not set to avoid immediate crash
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-# Load and enrich data
-df = core_engine.load_and_enrich_data()
+# Load and enrich data (prefers cleaned JSON, falls back to xlsx+regex)
+df = core_engine.load_cleaned_inventory()
+
+# Pre-compute embeddings for semantic search fallback
+_hardware_names = df['Name'].tolist() if not df.empty else []
+_embeddings = core_engine.generate_embeddings(client, _hardware_names) if _hardware_names else np.array([])
 
 def build_response(user_message, recent_context=""):
     """Process user message and return a structured HTML/Markdown chatbot response."""
@@ -29,6 +34,7 @@ def build_response(user_message, recent_context=""):
             "• `all non rgb rams with 5200 mhz`\n"
             "• `all 6000mhz ram or 5200 mhz ram`\n"
             "• `specific any gpu name 5090 tuf`\n"
+            "• `ram under 10k`\n"
             "• `list all` — show everything"
         )
 
@@ -37,13 +43,25 @@ def build_response(user_message, recent_context=""):
         lines = [f"• **{row['Name']}** ({row['Category']}) — {core_engine.format_price(row['price'])}" for _, row in df.iterrows()]
         return "Here are all components in inventory:\n\n" + "\n".join(lines)
 
-    # Intelligent Search
+    # Intelligent Search with dynamic fallback
     try:
         intent_obj = core_engine.extract_search_intent(client, user_message, recent_context)
-        filtered_df = core_engine.execute_pandas_filters(df, intent_obj)
-        
+
+        # Tier 1: strict filters with progressive relaxation
+        filtered_df, was_relaxed, relaxed_fields = core_engine.execute_with_fallback(df, intent_obj)
+
+        # Tier 2: semantic search if relaxation still returned nothing
+        if filtered_df.empty and len(_hardware_names) > 0:
+            filtered_df = core_engine.semantic_search(client, user_message, df, _embeddings, top_k=10)
+            if not filtered_df.empty:
+                records = filtered_df.to_dict('records')
+                lines = [f"🔍 No exact filter match. Here are the **top {len(records)} semantically similar** items:\n"]
+                for m in records:
+                    lines.append(f"• **{m['Name']}** — {core_engine.format_price(m['price'])}")
+                return "\n".join(lines)
+
+        # Tier 3: LLM apology
         if filtered_df.empty:
-            # Fallback
             fallback_prompt = f"The user asked: '{user_message}'. Parsed as: {intent_obj.model_dump_json(exclude_none=True)}. No inventory matched. Formulate conversational apology and proactively suggest dropping constraints."
             fallback_res = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -59,8 +77,14 @@ def build_response(user_message, recent_context=""):
             m = records[0]
             return f"**{m['Name']}** ({m.get('Category', '')}) — {core_engine.format_price(m['price'])}"
 
-        # Format multiple results as a neat list
-        lines = [f"Found {len(records)} matches for your criteria:\n"]
+        # Format multiple results
+        if was_relaxed:
+            relaxed_str = ", ".join(relaxed_fields)
+            header = f"⚡ No exact match — relaxed {relaxed_str} and found {len(records)} items:\n"
+        else:
+            header = f"Found {len(records)} matches for your criteria:\n"
+
+        lines = [header]
         for m in records:
             lines.append(f"• **{m['Name']}** — {core_engine.format_price(m['price'])}")
             

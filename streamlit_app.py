@@ -1,6 +1,7 @@
 import streamlit as st
 from openai import OpenAI
 import core_engine
+import numpy as np
 
 st.set_page_config(page_title="Price Bot", page_icon="💰", layout="centered")
 
@@ -8,9 +9,38 @@ client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 @st.cache_data
 def get_data():
-    return core_engine.load_and_enrich_data()
+    return core_engine.load_cleaned_inventory()
+
+@st.cache_data
+def get_embeddings(_client, names):
+    """Cache hardware name embeddings so they're computed once per session."""
+    return core_engine.generate_embeddings(_client, names)
 
 df = get_data()
+
+# Pre-compute embeddings for semantic search fallback
+hardware_names = df['Name'].tolist() if not df.empty else []
+if hardware_names:
+    embeddings = get_embeddings(client, hardware_names)
+else:
+    embeddings = np.array([])
+
+
+def _build_display_df(filtered_df):
+    """Build a display-ready dataframe from filtered results."""
+    cols_to_show = ['Category', 'Name', 'price']
+    for c in ['Brand', 'Speed', 'Latency', 'RGB', 'PCIe_Gen']:
+        if c in filtered_df.columns and not filtered_df[c].isna().all():
+            cols_to_show.append(c)
+            
+    display_df = filtered_df[cols_to_show].copy()
+    display_df['Price (INR)'] = display_df['price'].apply(core_engine.format_price)
+    display_df = display_df.drop(columns=['price'])
+    cols = display_df.columns.tolist()
+    cols.insert(2, cols.pop(cols.index('Price (INR)')))
+    display_df = display_df[cols]
+    return display_df
+
 
 def process_query(prompt):
     recent_context = st.session_state.get("last_intent", "")
@@ -21,11 +51,22 @@ def process_query(prompt):
     # Store for next conversational turn
     st.session_state.last_intent = intent_obj.model_dump_json(exclude_none=True)
     
-    # 2. Filter Multidimensional Pandas DataFrame
-    filtered_df = core_engine.execute_pandas_filters(df, intent_obj)
+    # 2. Filter with dynamic fallback
+    filtered_df, was_relaxed, relaxed_fields = core_engine.execute_with_fallback(df, intent_obj)
     
+    # 3. If still empty after relaxation, try semantic search
+    if filtered_df.empty and len(hardware_names) > 0:
+        filtered_df = core_engine.semantic_search(client, prompt, df, embeddings, top_k=10)
+        if not filtered_df.empty:
+            display_df = _build_display_df(filtered_df)
+            return {
+                "type": "dataframe",
+                "content": display_df,
+                "text": f"🔍 No exact filter match found. Here are the **top {len(filtered_df)} semantically similar** items:"
+            }
+
     if filtered_df.empty:
-        # Fallback secondary prompt (hidden from user)
+        # Final fallback — LLM apology (unchanged from original behavior)
         fallback_prompt = f"The user asked: '{prompt}'. We parsed it as: {intent_obj.model_dump_json(exclude_none=True)}. No inventory matched these exact criteria. Formulate a concise conversational apology, and proactively suggest dropping one of the specific constraints (like speed, exact latency, or trying a different brand) to find related items."
         fallback_res = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -45,21 +86,14 @@ def process_query(prompt):
         return {"type": "text", "content": msg}
     
     # Multiple items returned - render as interactive dataframe
-    cols_to_show = ['Category', 'Name', 'price']
-    for c in ['Brand', 'Speed', 'Latency', 'RGB', 'PCIe_Gen']:
-        if c in filtered_df.columns and not filtered_df[c].isna().all():
-            cols_to_show.append(c)
-            
-    display_df = filtered_df[cols_to_show].copy()
-    display_df['Price (INR)'] = display_df['price'].apply(core_engine.format_price)
-    # Drop original price integer column and rearrange
-    display_df = display_df.drop(columns=['price'])
-    # move Price (INR) to 3rd column
-    cols = display_df.columns.tolist()
-    cols.insert(2, cols.pop(cols.index('Price (INR)')))
-    display_df = display_df[cols]
+    display_df = _build_display_df(filtered_df)
     
-    preview_text = f"Found {len(records)} items matching your criteria:"
+    if was_relaxed:
+        relaxed_str = ", ".join(f"`{f}`" for f in relaxed_fields)
+        preview_text = f"⚡ No exact match — relaxed {relaxed_str} and found {len(records)} items:"
+    else:
+        preview_text = f"Found {len(records)} items matching your criteria:"
+    
     return {"type": "dataframe", "content": display_df, "text": preview_text}
 
 
@@ -77,7 +111,7 @@ st.caption("Intelligent Hardware Search Engine • Powered by structured logic")
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "type": "text", "content": "Hey! I'm the **Price Bot**. Ask me about any component price — CPUs, GPUs, RAM, SSDs, etc.\n\nTry asking: `list all 6000mhz ram with cl30` or `amd gpus in stock`"}
+        {"role": "assistant", "type": "text", "content": "Hey! I'm the **Price Bot**. Ask me about any component price — CPUs, GPUs, RAM, SSDs, etc.\n\nTry asking: `list all 6000mhz ram with cl30` or `amd gpus under 50k`"}
     ]
 
 # Render chat history
@@ -99,7 +133,7 @@ if prompt := st.chat_input("Ask about a component price..."):
 
     # Simple keyword commands 
     if prompt.lower() in ("help", "?", "commands"):
-        reply = "Try asking:\n- `all non rgb rams with 5200mhz`\n- `specific 5080 tuf`\n- `list of nvidia gpus in stock`"
+        reply = "Try asking:\n- `all non rgb rams with 5200mhz`\n- `specific 5080 tuf`\n- `list of nvidia gpus in stock`\n- `ram under 10k`"
         st.session_state.messages.append({"role": "assistant", "type": "text", "content": reply})
         with st.chat_message("assistant"):
             st.markdown(reply)
