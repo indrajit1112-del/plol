@@ -23,6 +23,10 @@ class HardwareQuery(BaseModel):
     min_price: Optional[int] = Field(None, description="Minimum price in INR. E.g. 'above 30k' -> 30000. Leave null if no lower bound mentioned.")
     max_price: Optional[int] = Field(None, description="Maximum price in INR. E.g. 'under 50k' -> 50000, 'below 1 lakh' -> 100000. Leave null if no upper bound.")
     inferred_tier: Optional[str] = Field(None, description="Inferred price/quality tier: 'budget', 'mid-range', or 'high-end'. Derive from cues like 'cheap'/'affordable' -> budget, 'best'/'top'/'flagship' -> high-end. Leave null if ambiguous.")
+    capacity_tb: Optional[float] = Field(None, description="Storage capacity in TB for SSDs. E.g. '2TB SSD' -> 2.0, '512GB SSD' -> 0.5. Leave null if not specified.")
+    vram_gb: Optional[int] = Field(None, description="Video RAM in GB for GPUs. E.g. '16GB GPU' -> 16, '8GB' -> 8. Leave null if not specified.")
+    color: Optional[str] = Field(None, description="Specific color edition requested. E.g. 'white gpu' -> 'White', 'black edition' -> 'Black'. Leave null if no color preference.")
+    keywords: Optional[List[str]] = Field(None, description="Additional distinguishing feature keywords. E.g. 'Twin Edge OC' -> ['Twin Edge', 'OC'], 'Pulse' -> ['Pulse']. Leave null if no specific features mentioned.")
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +96,11 @@ def load_cleaned_inventory(json_path=None):
             data = json.load(f)
         df = pd.DataFrame(data)
         # Ensure numeric columns are typed correctly
-        for col in ['price', 'Speed', 'Latency', 'PCIe_Gen']:
+        for col in ['price', 'Speed', 'Latency', 'PCIe_Gen', 'VRAM_GB']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
+        if 'Capacity_TB' in df.columns:
+            df['Capacity_TB'] = pd.to_numeric(df['Capacity_TB'], errors='coerce')
         if 'RGB' in df.columns:
             df['RGB'] = df['RGB'].astype(bool)
         return df
@@ -148,6 +154,29 @@ def extract_search_intent(client, user_message, recent_context=""):
     - "mid range", "decent" -> inferred_tier: "mid-range"
     - "best", "top", "flagship", "premium" -> inferred_tier: "high-end"
     - Leave null if no quality/tier cue is present.
+    
+    === STORAGE CAPACITY (capacity_tb) ===
+    - "2TB SSD" -> capacity_tb: 2.0
+    - "512GB SSD" -> capacity_tb: 0.5
+    - "1TB" -> capacity_tb: 1.0
+    - Convert GB to TB by dividing by 1000 (e.g. 512GB = 0.512, but round to 0.5).
+    - Leave null if no storage capacity is mentioned.
+    
+    === VIDEO RAM (vram_gb) ===
+    - "16GB GPU" -> vram_gb: 16
+    - "8GB" -> vram_gb: 8
+    - Only for GPUs. Leave null if not specified.
+    
+    === COLOR (color) ===
+    - "white gpu" -> color: "White"
+    - "black edition" -> color: "Black"
+    - Capitalize the color name. Leave null if no color preference.
+    
+    === KEYWORDS (keywords) ===
+    - Extract distinguishing feature names: "Twin Edge OC" -> keywords: ["Twin Edge", "OC"]
+    - "Pulse" -> keywords: ["Pulse"]
+    - "X3D" -> keywords: ["X3D"]
+    - Leave null if no specific features are mentioned.
     {context_note}
     """
 
@@ -204,6 +233,26 @@ def execute_pandas_filters(df, query_obj: HardwareQuery):
     if query_obj.max_price is not None:
         filtered_df = filtered_df[filtered_df['price'] <= query_obj.max_price]
 
+    # Capacity (TB) Mask — exact match
+    if query_obj.capacity_tb is not None and 'Capacity_TB' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['Capacity_TB'] == query_obj.capacity_tb]
+
+    # VRAM (GB) Mask — exact match
+    if query_obj.vram_gb is not None and 'VRAM_GB' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['VRAM_GB'] == query_obj.vram_gb]
+
+    # Color Mask — case-insensitive substring match on Name
+    if query_obj.color:
+        color_mask = filtered_df['Name'].str.contains(query_obj.color, case=False, regex=False, na=False)
+        if 'Color' in filtered_df.columns:
+            color_mask = color_mask | filtered_df['Color'].str.contains(query_obj.color, case=False, regex=False, na=False)
+        filtered_df = filtered_df[color_mask]
+
+    # Keywords Mask — ALL keywords must appear in Name (case-insensitive)
+    if query_obj.keywords and len(query_obj.keywords) > 0:
+        for kw in query_obj.keywords:
+            filtered_df = filtered_df[filtered_df['Name'].str.contains(kw, case=False, regex=False, na=False)]
+
     # Specific Model Fuzzy Fallback
     if query_obj.specific_model:
         exact_mask = filtered_df['Name'].str.contains(query_obj.specific_model, case=False, regex=False, na=False)
@@ -226,7 +275,7 @@ def execute_pandas_filters(df, query_obj: HardwareQuery):
 # ---------------------------------------------------------------------------
 
 # Constraints stripped in order of strictness (strictest first)
-_RELAXATION_ORDER = ['specific_model', 'max_cas_latency', 'speed_mhz', 'min_price', 'max_price']
+_RELAXATION_ORDER = ['specific_model', 'keywords', 'color', 'vram_gb', 'capacity_tb', 'max_cas_latency', 'speed_mhz', 'min_price', 'max_price']
 
 def execute_with_fallback(df, query_obj: HardwareQuery):
     """Run filters; if empty, progressively strip the strictest constraints and re-run.

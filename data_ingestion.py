@@ -15,7 +15,7 @@ import json
 import time
 import openpyxl
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
@@ -28,6 +28,10 @@ class HardwareSpecs(BaseModel):
     is_rgb: Optional[bool] = Field(None, description="True if the product name indicates RGB lighting, False if explicitly 'non-RGB', null if unclear.")
     pcie_gen: Optional[int] = Field(None, description="PCIe generation for SSDs (e.g. 3, 4, 5). null for non-SSD items.")
     brand: Optional[str] = Field(None, description="GPU brand: 'Nvidia' or 'AMD'. null for non-GPU items. Infer from keywords like RTX/GeForce -> Nvidia, RX/Radeon -> AMD.")
+    capacity_tb: Optional[float] = Field(None, description="Storage capacity in Terabytes for SSDs. Convert GB to TB (e.g. '2TB' -> 2.0, '1TB' -> 1.0, '512GB' -> 0.5, '256GB' -> 0.25). null for non-storage items.")
+    vram_gb: Optional[int] = Field(None, description="Video RAM in GB for GPUs (e.g. '16GB' -> 16, '8GB' -> 8, '24GB' -> 24). null for non-GPU items.")
+    color: Optional[str] = Field(None, description="Specific color edition if mentioned (e.g. 'White', 'Black', 'Silver'). null if no color variant is indicated.")
+    keywords: Optional[List[str]] = Field(None, description="Other distinguishing features or model identifiers not captured by other fields (e.g. ['Twin Edge', 'OC'], ['Pulse'], ['X3D'], ['7000mbps']). null if none.")
 
 
 def load_raw_data(xlsx_path: str) -> list[dict]:
@@ -73,6 +77,10 @@ def extract_specs_batch(client: OpenAI, items: list[dict], batch_size: int = 20)
                                     "- is_rgb: true if 'RGB' in name, false if 'non-RGB' or similar, null otherwise\n"
                                     "- pcie_gen: PCIe gen for SSDs (e.g. Gen4 -> 4)\n"
                                     "- brand: 'Nvidia' for RTX/GTX/GeForce, 'AMD' for RX/Radeon. Also check category.\n"
+                                    "- capacity_tb: storage capacity in TB for SSDs. Convert GB to TB (512GB->0.5, 1TB->1.0, 2TB->2.0). null for non-storage.\n"
+                                    "- vram_gb: video RAM in GB for GPUs (e.g. 16GB->16). null for non-GPU.\n"
+                                    "- color: color edition if present (e.g. 'White', 'Black'). null if none.\n"
+                                    "- keywords: list of other distinguishing features (e.g. ['Twin Edge', 'OC'], ['Pulse'], ['X3D']). null if none.\n"
                                     "Return null for any field that doesn't apply to this product type."
                                 )
                             },
@@ -95,7 +103,11 @@ def extract_specs_batch(client: OpenAI, items: list[dict], batch_size: int = 20)
                         "Latency": specs.latency,
                         "RGB": specs.is_rgb if specs.is_rgb is not None else False,
                         "Brand": specs.brand,
-                        "PCIe_Gen": specs.pcie_gen
+                        "PCIe_Gen": specs.pcie_gen,
+                        "Capacity_TB": specs.capacity_tb,
+                        "VRAM_GB": specs.vram_gb,
+                        "Color": specs.color,
+                        "Keywords": specs.keywords
                     })
                     break  # success
 
@@ -114,7 +126,11 @@ def extract_specs_batch(client: OpenAI, items: list[dict], batch_size: int = 20)
                             "Latency": None,
                             "RGB": False,
                             "Brand": None,
-                            "PCIe_Gen": None
+                            "PCIe_Gen": None,
+                            "Capacity_TB": None,
+                            "VRAM_GB": None,
+                            "Color": None,
+                            "Keywords": None
                         })
 
         # Small delay between batches to respect rate limits

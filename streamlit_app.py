@@ -29,7 +29,7 @@ else:
 def _build_display_df(filtered_df):
     """Build a display-ready dataframe from filtered results."""
     cols_to_show = ['Category', 'Name', 'price']
-    for c in ['Brand', 'Speed', 'Latency', 'RGB', 'PCIe_Gen']:
+    for c in ['Brand', 'Speed', 'Latency', 'RGB', 'PCIe_Gen', 'Capacity_TB', 'VRAM_GB', 'Color']:
         if c in filtered_df.columns and not filtered_df[c].isna().all():
             cols_to_show.append(c)
             
