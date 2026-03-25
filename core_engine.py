@@ -11,10 +11,10 @@ class HardwareQuery(BaseModel):
     category: Optional[str] = Field(None, description="Primary hardware subset. Examples: 'GPU', 'RAM', 'CPU', 'SSD', 'Quadro'")
     gpu_brand: Optional[str] = Field(None, description="Extract 'AMD' or 'Nvidia' from conversational cues. E.g. 'Radeon' or 'RX' -> AMD. 'GeForce' or 'RTX' -> Nvidia.")
     ssd_gen: Optional[int] = Field(None, description="PCIe Generation for SSDs (e.g., 3, 4, 5). Extract 5 from 'Gen5 SSD'.")
-    speed_mhz: Optional[List[int]] = Field(None, description="Array of clock speeds in MHz (e.g. [6000, 5200]). Only fill if asked explicitly.")
+    speed_mhz: Optional[List[int]] = Field(None, description="Array of clock speeds in MHz (e.g. [6000, 5200]). IMPORTANT: Only fill this for RAM. Never put GPU model numbers (like 5080, 5090) here.")
     cas_latency: Optional[int] = Field(None, description="Absolute numerical value of CL latency (e.g. 30, 32, 36).")
     is_rgb: Optional[bool] = Field(None, description="Strict inclusion (true), strict exclusion (false), or indifference (null) toward RGB lighting.")
-    specific_model: Optional[str] = Field(None, description="Highly specific nomenclature intended for exact substring matching (e.g. '7800X 3D'). Exclude vague terms like 'gpu'.")
+    specific_model: Optional[str] = Field(None, description="Highly specific nomenclature for substring matching (e.g. '7800X 3D', '5080', '5090 TUF'). MUST EXCLUDE general terms like 'all ram', 'gpu', 'mhz', 'list'. Leave null if query is generic.")
 
 def load_and_enrich_data(xlsx_path=None):
     if not xlsx_path:
@@ -82,6 +82,8 @@ def extract_search_intent(client, user_message, recent_context=""):
     - Logical Disjunctions: Handle "OR" statements. E.g. "all 6000mhz ram or 5200 mhz ram" -> speed_mhz: [6000, 5200]
     - RGB state: "Show me all RGB rams" -> is_rgb: true. "All non rgb rams" -> is_rgb: false. "All rams with cl30" (no mention of lighting) -> is_rgb: null.
     - Explicit exclusions (e.g., "no rgb", "-rgb") -> is_rgb: false.
+    - specific_model: MUST ONLY contain the actual product identifier. If the user types "all ram" or "6000 ram", specific_model MUST be null. Only use for things like "5080", "5090", "7800X 3D".
+    - speed_mhz: MUST NEVER contain GPU model numbers like 5080, 5090, 4070. Only use for memory speeds like 5200, 6000.
     - Do not guess constraints if they are not explicitly specified.
     {context_note}
     """
