@@ -10,6 +10,7 @@ from thefuzz import fuzz, process
 class HardwareQuery(BaseModel):
     category: Optional[str] = Field(None, description="Primary hardware subset. Examples: 'GPU', 'RAM', 'CPU', 'SSD', 'Quadro'")
     gpu_brand: Optional[str] = Field(None, description="Extract 'AMD' or 'Nvidia' from conversational cues. E.g. 'Radeon' or 'RX' -> AMD. 'GeForce' or 'RTX' -> Nvidia.")
+    ssd_gen: Optional[int] = Field(None, description="PCIe Generation for SSDs (e.g., 3, 4, 5). Extract 5 from 'Gen5 SSD'.")
     speed_mhz: Optional[List[int]] = Field(None, description="Array of clock speeds in MHz (e.g. [6000, 5200]). Only fill if asked explicitly.")
     cas_latency: Optional[int] = Field(None, description="Absolute numerical value of CL latency (e.g. 30, 32, 36).")
     is_rgb: Optional[bool] = Field(None, description="Strict inclusion (true), strict exclusion (false), or indifference (null) toward RGB lighting.")
@@ -55,8 +56,12 @@ def load_and_enrich_data(xlsx_path=None):
 
     # GPU Brand
     df['Brand'] = None
+    # Check explicitly in Name
     df.loc[df['Name'].str.contains(r'(?i)\b(?:Nvidia|RTX|GTX|GeForce)\b', na=False), 'Brand'] = 'Nvidia'
     df.loc[df['Name'].str.contains(r'(?i)\b(?:AMD|RX|Radeon)\b', na=False), 'Brand'] = 'AMD'
+    # Fallback checking Category (fixes issues where GPU name is just "5080" without RTX)
+    df.loc[df['Brand'].isna() & df['Category'].str.contains(r'(?i)Nvidia', na=False), 'Brand'] = 'Nvidia'
+    df.loc[df['Brand'].isna() & df['Category'].str.contains(r'(?i)AMD', na=False), 'Brand'] = 'AMD'
 
     # SSD PCIe Gen
     df['PCIe_Gen'] = pd.to_numeric(df['Name'].str.extract(r'(?i)Gen(\d)')[0])
@@ -73,6 +78,7 @@ def extract_search_intent(client, user_message, recent_context=""):
     
     Rules:
     - GPU Brands: 'Radeon' or 'RX' maps to gpu_brand: 'AMD'. 'GeForce' or 'RTX' maps to gpu_brand: 'Nvidia'.
+    - SSD Generation: 'Gen5 SSD' maps to ssd_gen: 5. 'Gen4' maps to 4.
     - Logical Disjunctions: Handle "OR" statements. E.g. "all 6000mhz ram or 5200 mhz ram" -> speed_mhz: [6000, 5200]
     - RGB state: "Show me all RGB rams" -> is_rgb: true. "All non rgb rams" -> is_rgb: false. "All rams with cl30" (no mention of lighting) -> is_rgb: null.
     - Explicit exclusions (e.g., "no rgb", "-rgb") -> is_rgb: false.
@@ -117,6 +123,10 @@ def execute_pandas_filters(df, query_obj: HardwareQuery):
     # explicit RGB explicit Mask
     if query_obj.is_rgb is not None:
         filtered_df = filtered_df[filtered_df['RGB'] == query_obj.is_rgb]
+
+    # SSD PCIe Gen Mask
+    if query_obj.ssd_gen:
+        filtered_df = filtered_df[filtered_df['PCIe_Gen'] == query_obj.ssd_gen]
 
     # Specific Model Fuzzy Fallback
     if query_obj.specific_model:
