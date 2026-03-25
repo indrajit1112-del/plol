@@ -3,3 +3,5 @@ openpyxl
 thefuzz
 python-Levenshtein
 openai
+pandas
+pydantic

@@ -1,117 +1,77 @@
-from flask import Flask, request, jsonify, render_template_string
-import openpyxl
-from thefuzz import fuzz, process
 import os
+from flask import Flask, request, jsonify, render_template_string
+from openai import OpenAI
+import core_engine
 
 app = Flask(__name__)
 
-def load_prices():
-    """Load component prices from the Excel file."""
-    xlsx_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prices.xlsx")
-    wb = openpyxl.load_workbook(xlsx_path, read_only=True)
-    ws = wb.active
-    items = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        category, name, price = row[0], row[1], row[2]
-        if name and price is not None:
-            items.append({"category": str(category).strip() if category else "Other", "name": str(name).strip(), "price": int(price)})
-    wb.close()
-    return items
+# Initialize OpenAI client (requires OPENAI_API_KEY environment variable)
+# Default to empty string for safety if not set to avoid immediate crash
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
 
-PRICES = load_prices()
-COMPONENT_NAMES = [item["name"] for item in PRICES]
+# Load and enrich data
+df = core_engine.load_and_enrich_data()
 
-def format_price(price):
-    """Format price in Indian numbering system with rupee symbol."""
-    s = str(price)
-    if len(s) <= 3:
-        return f"\u20b9{s}"
-    last3 = s[-3:]
-    remaining = s[:-3]
-    groups = []
-    while remaining:
-        groups.append(remaining[-2:])
-        remaining = remaining[:-2]
-    groups.reverse()
-    return f"\u20b9{','.join(groups)},{last3}"
-
-def parse_exclusions(query):
-    """Split query into search terms and exclusion keywords (prefixed with -)."""
-    parts = query.strip().split()
-    search_parts = []
-    excludes = []
-    for part in parts:
-        if part.startswith("-") and len(part) > 1:
-            excludes.append(part[1:].lower())
-        else:
-            search_parts.append(part)
-    return " ".join(search_parts), excludes
-
-def apply_exclusions(items, excludes):
-    """Filter out items whose name contains any exclusion keyword."""
-    if not excludes:
-        return items
-    return [item for item in items if not any(ex in item["name"].lower() for ex in excludes)]
-
-def search_components(query, limit=5):
-    """Fuzzy search components matching the query, supporting -keyword exclusions."""
-    search_query, excludes = parse_exclusions(query)
-    if not search_query:
-        return []
-
-    # Try exact substring match first
-    exact_matches = [item for item in PRICES if search_query.lower() in item["name"].lower()]
-    if exact_matches:
-        return apply_exclusions(exact_matches, excludes)[:limit]
-
-    # Fall back to fuzzy matching
-    results = process.extract(search_query, COMPONENT_NAMES, scorer=fuzz.token_set_ratio, limit=limit * 3)
-    matched = []
-    for result in results:
-        name, score = result[0], result[1]
-        if score >= 45:
-            item = next(i for i in PRICES if i["name"] == name)
-            matched.append(item)
-    return apply_exclusions(matched, excludes)[:limit]
-
-def build_response(user_message):
-    """Process user message and return a chatbot response."""
+def build_response(user_message, recent_context=""):
+    """Process user message and return a structured HTML/Markdown chatbot response."""
     msg = user_message.strip().lower()
 
     # Greetings
     if msg in ("hi", "hello", "hey", "yo", "sup"):
-        return "Hey! I'm the Price Bot. Ask me about any component price — CPUs, GPUs, RAM, SSDs, etc."
+        return "Hey! I'm the **Price Bot**. Ask me about any component price — CPUs, GPUs, RAM, SSDs, etc."
 
     # Help
     if msg in ("help", "?", "commands"):
         return (
-            "Just type a component name and I'll find its price!\n\n"
+            "Just type a component name or specific constraints and I'll find its price!\n\n"
             "**Examples:**\n"
-            "• `5080`\n"
-            "• `DDR5 6000`\n"
-            "• `9070XT`\n"
-            "• `1TB Gen4`\n"
-            "• `DDR5 -rgb` — exclude RGB variants\n"
+            "• `list of amd gpus in stock`\n"
+            "• `all non rgb rams with 5200 mhz`\n"
+            "• `all 6000mhz ram or 5200 mhz ram`\n"
+            "• `specific any gpu name 5090 tuf`\n"
             "• `list all` — show everything"
         )
 
     # List all
     if msg in ("list all", "show all", "all", "list", "all prices", "show everything"):
-        lines = [f"• **{item['name']}** — {format_price(item['price'])}" for item in PRICES]
-        return "Here are all components:\n\n" + "\n".join(lines)
+        lines = [f"• **{row['Name']}** ({row['Category']}) — {core_engine.format_price(row['price'])}" for _, row in df.iterrows()]
+        return "Here are all components in inventory:\n\n" + "\n".join(lines)
 
-    # Search
-    matches = search_components(user_message)
-    if not matches:
-        return f"Sorry, I couldn't find anything matching **\"{user_message}\"**. Try a different name or type `help` for examples."
+    # Intelligent Search
+    try:
+        intent_obj = core_engine.extract_search_intent(client, user_message, recent_context)
+        filtered_df = core_engine.execute_pandas_filters(df, intent_obj)
+        
+        if filtered_df.empty:
+            # Fallback
+            fallback_prompt = f"The user asked: '{user_message}'. Parsed as: {intent_obj.model_dump_json(exclude_none=True)}. No inventory matched. Formulate conversational apology and proactively suggest dropping constraints."
+            fallback_res = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": "You are a helpful hardware assistant."}, {"role": "user", "content": fallback_prompt}],
+                temperature=0.5,
+                max_tokens=150
+            )
+            return fallback_res.choices[0].message.content.strip()
 
-    if len(matches) == 1:
-        m = matches[0]
-        return f"**{m['name']}** — {format_price(m['price'])}"
+        records = filtered_df.to_dict('records')
+        
+        if len(records) == 1:
+            m = records[0]
+            return f"**{m['Name']}** ({m.get('Category', '')}) — {core_engine.format_price(m['price'])}"
 
-    lines = [f"• **{m['name']}** — {format_price(m['price'])}" for m in matches]
-    return f"Found {len(matches)} matches:\n\n" + "\n".join(lines)
+        # Format multiple results as a neat list
+        lines = [f"Found {len(records)} matches for your criteria:\n"]
+        for m in records:
+            lines.append(f"• **{m['Name']}** — {core_engine.format_price(m['price'])}")
+            
+        return "\n".join(lines)
 
+    except Exception as e:
+        # Fallback if OpenAI fails or key is missing
+        return f"Error connecting to intelligence engine. Ensure OPENAI_API_KEY is set. Technical details: {str(e)}"
+
+# A simple in-memory session store (dictionary mapping IP -> context string) for simplicity
+sessions = {}
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -258,7 +218,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div class="header">
   <div class="dot"></div>
   <h1>Price Bot</h1>
-  <span class="subtitle">Component prices &bull; Fuzzy search</span>
+  <span class="subtitle">AI Hardware Search Engine</span>
 </div>
 
 <div class="chat-container" id="chat">
@@ -324,11 +284,9 @@ async function send() {
 </body>
 </html>"""
 
-
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
-
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -336,10 +294,17 @@ def chat():
     if not data or "message" not in data:
         return jsonify({"reply": "Please send a message."}), 400
     user_message = str(data["message"]).strip()[:200]
-    reply = build_response(user_message)
+    
+    ip = request.remote_addr
+    recent_context = sessions.get(ip, "")
+    
+    reply = build_response(user_message, recent_context)
+    
+    # Store minimal intent for next turn if needed (simplified for flask, actual intents handled in core engine)
+    sessions[ip] = f"{user_message} -> {reply[:50]}..."
+    
     return jsonify({"reply": reply})
 
-
 if __name__ == "__main__":
-    print("Price Bot running at http://localhost:6699")
+    print("Price Bot Intelligent Engine running at http://localhost:6699")
     app.run(host="127.0.0.1", port=6699, debug=False)
